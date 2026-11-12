@@ -8,6 +8,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -16,7 +17,10 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from . import http
 from .config import load_config
+from .media import fetch_image
+from .price import SolPrice
 from .db import WalletStore
 from .watcher import watch_launches
 
@@ -81,11 +85,19 @@ def list_view(store: WalletStore, page: int) -> tuple[str, InlineKeyboardMarkup 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def format_alert(event: dict, label: str | None) -> str:
+def usd(v: float) -> str:
+    if v >= 1_000_000:
+        return f"${v / 1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v / 1_000:.1f}K"
+    return f"${v:,.0f}"
+
+
+def format_alert(event: dict, label: str | None, sol_usd: float | None = None) -> str:
     mint = event.get("mint", "")
     dev = event.get("traderPublicKey", "")
-    name = html.escape(str(event.get("name", "?")))
-    symbol = html.escape(str(event.get("symbol", "?")))
+    name = html.escape(str(event.get("name", "?"))[:64])
+    symbol = html.escape(str(event.get("symbol", "?"))[:20])
     sig = event.get("signature", "")
     dev_name = f"{html.escape(label)} (<code>{dev}</code>)" if label else f"<code>{dev}</code>"
     parts = [
@@ -96,9 +108,12 @@ def format_alert(event: dict, label: str | None) -> str:
         f"Dev: {dev_name}",
     ]
     if event.get("solAmount") is not None:
-        parts.append(f"Dev buy: {float(event['solAmount']):.3f} SOL")
+        sol = float(event["solAmount"])
+        extra = f" ({usd(sol * sol_usd)})" if sol_usd else ""
+        parts.append(f"Dev buy: {sol:.3f} SOL{extra}" if sol > 0 else "Dev buy: нет")
     if event.get("marketCapSol") is not None:
-        parts.append(f"MC: {float(event['marketCapSol']):.1f} SOL")
+        mc = float(event["marketCapSol"])
+        parts.append(f"MC: <b>{usd(mc * sol_usd)}</b>" if sol_usd else f"MC: {mc:.1f} SOL")
     if event.get("pool"):
         parts.append(f"Платформа: {html.escape(str(event['pool']))}")
     parts += [
@@ -112,7 +127,20 @@ def format_alert(event: dict, label: str | None) -> str:
     return "\n".join(parts)
 
 
-def build_router(store: WalletStore, admin_ids: frozenset[int], alert_chat_id: int) -> Router:
+async def send_alert(bot: Bot, chat_id: int, event: dict, label: str | None, sol_usd: float | None) -> None:
+    text = format_alert(event, label, sol_usd)
+    image = await fetch_image(event.get("uri"))
+    if image:
+        try:
+            await bot.send_photo(chat_id, BufferedInputFile(image, "coin.png"), caption=text)
+            return
+        except Exception as e:  # битая картинка, слишком длинная подпись и т.п.
+            log.info("Не удалось отправить фото, шлю текстом: %r", e)
+    await bot.send_message(chat_id, text, disable_web_page_preview=True)
+
+
+def build_router(store: WalletStore, admin_ids: frozenset[int], alert_chat_id: int,
+                 price: SolPrice) -> Router:
     r = Router()
     # /chatid работает везде и для всех — чтобы узнать id группы для алертов
     @r.message(Command("chatid"))
@@ -214,13 +242,14 @@ def build_router(store: WalletStore, admin_ids: frozenset[int], alert_chat_id: i
     async def test_cmd(m: Message, bot: Bot):
         fake = {
             "mint": "So11111111111111111111111111111111111111112",
+            "uri": "https://ipfs.io/ipfs/bafkreicavsn2tsgh2nr5bsf4uhuu4nnhhtkl4476icf6a6kkpi3ihz4zhq",
             "traderPublicKey": "11111111111111111111111111111111",
             "name": "TEST", "symbol": "TEST", "solAmount": 1.0, "marketCapSol": 30.0,
             "signature": "", "pool": "pump",
         }
         try:
-            await bot.send_message(alert_chat_id, "🧪 Тест\n\n" + format_alert(fake, "test"),
-                                   disable_web_page_preview=True)
+            fake["name"] = "🧪 TEST"
+            await send_alert(bot, alert_chat_id, fake, "test", price.usd)
             await m.answer(f"Тестовый алерт отправлен в <code>{alert_chat_id}</code> ✅")
         except Exception as e:
             await m.answer(f"Не смог отправить в <code>{alert_chat_id}</code>: {html.escape(str(e))}\n"
@@ -242,17 +271,22 @@ async def main() -> None:
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
-    dp.include_router(build_router(store, cfg.admin_ids, cfg.alert_chat_id))
+    price = SolPrice()
+    await price.refresh()
+    log.info("Цена SOL: %s USD", price.usd)
+    dp.include_router(build_router(store, cfg.admin_ids, cfg.alert_chat_id, price))
 
     async def on_launch(event: dict) -> None:
         label = store.label(event["traderPublicKey"])
         log.info("Запуск от %s: %s", event["traderPublicKey"], event.get("mint"))
-        await bot.send_message(cfg.alert_chat_id, format_alert(event, label),
-                               disable_web_page_preview=True)
+        await send_alert(bot, cfg.alert_chat_id, event, label, price.usd)
 
     watcher = asyncio.create_task(watch_launches(store, on_launch))
+    price_task = asyncio.create_task(price.run())
     try:
         await dp.start_polling(bot)
     finally:
         watcher.cancel()
+        price_task.cancel()
         await bot.session.close()
+        await http.close()
